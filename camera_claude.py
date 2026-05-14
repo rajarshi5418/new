@@ -1,12 +1,27 @@
 """
 Camera capture + Claude vision app.
 
-Captures a photo from the device webcam, saves it to disk, and sends it to
-Claude claude-sonnet-4-6 for analysis.  The system prompt is marked with
-cache_control so repeated runs reuse the cached prefix (Sonnet 4.6 minimum:
-2 048 tokens — the prompt below meets that threshold).
+Captures a photo from a webcam or phone camera (via IP stream), saves it to
+disk, and sends it to Claude claude-sonnet-4-6 for analysis.  The system
+prompt is marked with cache_control so repeated runs reuse the cached prefix
+(Sonnet 4.6 minimum: 2 048 tokens — the prompt below meets that threshold).
+
+Phone camera setup
+------------------
+Android — install "IP Webcam" (Play Store):
+  1. Open the app → tap "Start server"
+  2. Note the URL shown, e.g. http://192.168.1.42:8080
+  3. Run:  python camera_claude.py --source http://192.168.1.42:8080/video
+
+iOS — install "EpocCam" or "Camo" and follow their desktop driver instructions,
+      OR use any MJPEG/RTSP camera app and pass the stream URL via --source.
+
+DroidCam (Android/iOS, also works over USB):
+  https://www.dev47apps.com — free tier gives 640×480; use the desktop client
+  URL, e.g. http://192.168.1.42:4747/video
 """
 
+import argparse
 import base64
 import os
 import sys
@@ -23,7 +38,6 @@ import cv2
 
 MODEL = "claude-sonnet-4-6"
 OUTPUT_DIR = Path("captured_photos")
-CAMERA_INDEX = 0          # 0 = default webcam; change for external cameras
 CAPTURE_DELAY_FRAMES = 30  # warm-up frames so auto-exposure can settle
 
 # The system prompt is long enough (>2 048 tokens) to qualify for Sonnet 4.6
@@ -81,24 +95,44 @@ say so rather than guessing.  Focus on what is actually visible in the image.
 # Camera capture
 # ---------------------------------------------------------------------------
 
-def capture_photo(camera_index: int = CAMERA_INDEX,
+def parse_source(raw: str) -> int | str:
+    """Convert a CLI source string to an int index or leave as a URL string."""
+    try:
+        return int(raw)
+    except ValueError:
+        return raw  # treat as URL / device path
+
+
+def capture_photo(source: int | str = 0,
                   warmup_frames: int = CAPTURE_DELAY_FRAMES) -> tuple[bool, object]:
-    """Open the webcam, discard warm-up frames, then grab one frame.
+    """Open a webcam or IP-camera stream, grab one frame, and release.
+
+    source can be:
+      - int  : local camera index (0 = default webcam)
+      - str  : MJPEG/RTSP URL, e.g. 'http://192.168.1.42:8080/video'
 
     Returns (success, frame).  frame is None on failure.
     """
-    print(f"[camera] Opening camera index {camera_index} …")
-    cap = cv2.VideoCapture(camera_index)
+    label = f"camera {source}" if isinstance(source, int) else f"stream {source}"
+    print(f"[camera] Connecting to {label} …")
+    cap = cv2.VideoCapture(source)
 
     if not cap.isOpened():
-        print(f"[error] Could not open camera {camera_index}.", file=sys.stderr)
+        print(f"[error] Could not open {label}.", file=sys.stderr)
+        if isinstance(source, str):
+            print(
+                "[hint]  Make sure your phone and this computer are on the same\n"
+                "        Wi-Fi network and the streaming app is running.",
+                file=sys.stderr,
+            )
         return False, None
 
-    # Discard warm-up frames so auto-exposure / white-balance can settle.
-    print(f"[camera] Warming up ({warmup_frames} frames) …", end="", flush=True)
-    for _ in range(warmup_frames):
-        cap.read()
-    print(" done.")
+    # Phone streams often don't need warm-up; skip for URL sources.
+    if isinstance(source, int) and warmup_frames > 0:
+        print(f"[camera] Warming up ({warmup_frames} frames) …", end="", flush=True)
+        for _ in range(warmup_frames):
+            cap.read()
+        print(" done.")
 
     ret, frame = cap.read()
     cap.release()
@@ -127,7 +161,6 @@ def show_preview(frame, timeout_ms: int = 2000) -> None:
         cv2.waitKey(timeout_ms)
         cv2.destroyAllWindows()
     except cv2.error:
-        # Headless / no display available — just skip the preview.
         pass
 
 
@@ -142,15 +175,10 @@ def encode_image_base64(image_path: Path) -> str:
 
 
 def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
-    """Send the photo to Claude claude-sonnet-4-6 and return the analysis text.
-
-    The system prompt is sent with cache_control=ephemeral so the compiled
-    prefix is reused on repeat calls (saves ~90 % of system-prompt token cost).
-    """
+    """Send the photo to Claude claude-sonnet-4-6 and return the analysis text."""
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from environment
 
     image_data = encode_image_base64(image_path)
-    media_type = "image/jpeg"
 
     question = user_prompt.strip() or (
         "Please analyse this photo in detail following your structured format."
@@ -161,10 +189,6 @@ def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
     response = client.messages.create(
         model=MODEL,
         max_tokens=2048,
-        # --- System prompt with prompt caching ---
-        # cache_control marks the end of the cacheable prefix.  Sonnet 4.6
-        # requires ≥ 2 048 tokens to create a cache entry; this prompt
-        # comfortably exceeds that threshold.
         system=[
             {
                 "type": "text",
@@ -180,7 +204,7 @@ def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": media_type,
+                            "media_type": "image/jpeg",
                             "data": image_data,
                         },
                     },
@@ -193,7 +217,6 @@ def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
         ],
     )
 
-    # Log cache usage so the user can verify caching is working.
     usage = response.usage
     print(
         f"[claude] Tokens — input: {usage.input_tokens}, "
@@ -210,12 +233,43 @@ def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    # Optional: accept a custom question from the command line.
-    user_prompt = " ".join(sys.argv[1:])
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Capture a photo from a camera or phone stream and analyse it with Claude.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python camera_claude.py                              # default webcam
+  python camera_claude.py --source 1                  # second webcam
+  python camera_claude.py --source http://192.168.1.42:8080/video   # Android IP Webcam
+  python camera_claude.py --source http://192.168.1.42:4747/video   # DroidCam
+  python camera_claude.py --source rtsp://192.168.1.42:8080/h264    # RTSP stream
+  python camera_claude.py "How many people are in this photo?"
+        """,
+    )
+    p.add_argument(
+        "--source",
+        default="0",
+        metavar="CAM",
+        help="Camera index (default: 0) or stream URL (MJPEG/RTSP).",
+    )
+    p.add_argument(
+        "question",
+        nargs="*",
+        help="Optional custom question to ask Claude about the photo.",
+    )
+    return p
 
-    # 1. Capture photo from webcam.
-    success, frame = capture_photo()
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    source = parse_source(args.source)
+    user_prompt = " ".join(args.question)
+
+    # 1. Capture photo.
+    success, frame = capture_photo(source)
     if not success:
         sys.exit(1)
 
