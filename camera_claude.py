@@ -1,35 +1,48 @@
 """
-Camera capture + Claude vision app.
+Camera capture + Claude vision app — with iOS phone camera support.
 
-Captures a photo from a webcam or phone camera (via IP stream), saves it to
-disk, and sends it to Claude claude-sonnet-4-6 for analysis.  The system
-prompt is marked with cache_control so repeated runs reuse the cached prefix
-(Sonnet 4.6 minimum: 2 048 tokens — the prompt below meets that threshold).
+Captures a photo from a webcam, Android IP stream, or iOS phone camera,
+saves it to disk, and sends it to Claude claude-sonnet-4-6 for analysis.
 
-Phone camera setup
-------------------
-Android — install "IP Webcam" (Play Store):
-  1. Open the app → tap "Start server"
-  2. Note the URL shown, e.g. http://192.168.1.42:8080
-  3. Run:  python camera_claude.py --source http://192.168.1.42:8080/video
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+iOS SETUP (two options)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-iOS — install "EpocCam" or "Camo" and follow their desktop driver instructions,
-      OR use any MJPEG/RTSP camera app and pass the stream URL via --source.
+Option A — Camo (recommended, best quality)
+  1. Install Camo on your iPhone: https://reincubate.com/camo/
+  2. Install the Camo desktop companion on your Mac/PC.
+  3. Connect via USB or Wi-Fi — Camo appears as a system webcam (index 0 or 1).
+  4. Run:  python camera_claude.py --source 0   (or --source 1)
 
-DroidCam (Android/iOS, also works over USB):
-  https://www.dev47apps.com — free tier gives 640×480; use the desktop client
-  URL, e.g. http://192.168.1.42:4747/video
+Option B — IP camera app (Wi-Fi, no cable needed)
+  Install any MJPEG/snapshot app, e.g.:
+    • "IP Camera Lite" (free, App Store)
+    • "iVCam" (App Store)
+    • "Iriun Webcam" (App Store + desktop client)
+  After starting the server in the app, run with its snapshot URL:
+    python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg
+  Or its MJPEG stream URL if the app provides one:
+    python camera_claude.py --source http://192.168.1.42:8080/video
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Android SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Install "IP Webcam" (Play Store), tap "Start server", then:
+    python camera_claude.py --source http://192.168.1.42:8080/video
+  Snapshot mode also works:
+    python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg
 """
 
 import argparse
 import base64
-import os
 import sys
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import anthropic
 import cv2
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -38,11 +51,8 @@ import cv2
 
 MODEL = "claude-sonnet-4-6"
 OUTPUT_DIR = Path("captured_photos")
-CAPTURE_DELAY_FRAMES = 30  # warm-up frames so auto-exposure can settle
+CAPTURE_DELAY_FRAMES = 30
 
-# The system prompt is long enough (>2 048 tokens) to qualify for Sonnet 4.6
-# prompt caching.  It is marked ephemeral so the first call writes the cache
-# and every subsequent call reads it at ~10 % of the normal input-token cost.
 SYSTEM_PROMPT = """\
 You are an expert visual analyst with deep knowledge across many domains including:
 
@@ -92,27 +102,52 @@ say so rather than guessing.  Focus on what is actually visible in the image.
 
 
 # ---------------------------------------------------------------------------
-# Camera capture
+# Camera capture — three modes
 # ---------------------------------------------------------------------------
 
 def parse_source(raw: str) -> int | str:
-    """Convert a CLI source string to an int index or leave as a URL string."""
     try:
         return int(raw)
     except ValueError:
-        return raw  # treat as URL / device path
+        return raw
 
 
-def capture_photo(source: int | str = 0,
-                  warmup_frames: int = CAPTURE_DELAY_FRAMES) -> tuple[bool, object]:
-    """Open a webcam or IP-camera stream, grab one frame, and release.
+def capture_from_snapshot_url(url: str) -> tuple[bool, object]:
+    """Fetch a single JPEG snapshot over HTTP (iOS/Android snapshot endpoint).
 
-    source can be:
-      - int  : local camera index (0 = default webcam)
-      - str  : MJPEG/RTSP URL, e.g. 'http://192.168.1.42:8080/video'
-
-    Returns (success, frame).  frame is None on failure.
+    Compatible with:
+      • IP Camera Lite  → http://<ip>:8080/shot.jpg
+      • IP Webcam (Android) → http://<ip>:8080/shot.jpg
+      • Any app that serves a static JPEG endpoint
     """
+    print(f"[camera] Fetching snapshot from {url} …")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "CameraClaude/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+    except Exception as exc:
+        print(f"[error] Could not fetch snapshot: {exc}", file=sys.stderr)
+        print(
+            "[hint]  Make sure your iPhone and this computer are on the same\n"
+            "        Wi-Fi network and the camera app server is running.",
+            file=sys.stderr,
+        )
+        return False, None
+
+    img_array = np.frombuffer(data, dtype=np.uint8)
+    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if frame is None:
+        print("[error] Downloaded data is not a valid JPEG image.", file=sys.stderr)
+        return False, None
+
+    h, w = frame.shape[:2]
+    print(f"[camera] Snapshot captured ({w}×{h}).")
+    return True, frame
+
+
+def capture_from_stream(source: int | str,
+                        warmup_frames: int = CAPTURE_DELAY_FRAMES) -> tuple[bool, object]:
+    """Open a local webcam index or MJPEG/RTSP stream URL."""
     label = f"camera {source}" if isinstance(source, int) else f"stream {source}"
     print(f"[camera] Connecting to {label} …")
     cap = cv2.VideoCapture(source)
@@ -121,13 +156,13 @@ def capture_photo(source: int | str = 0,
         print(f"[error] Could not open {label}.", file=sys.stderr)
         if isinstance(source, str):
             print(
-                "[hint]  Make sure your phone and this computer are on the same\n"
-                "        Wi-Fi network and the streaming app is running.",
+                "[hint]  Ensure your phone and this computer share the same\n"
+                "        Wi-Fi network and the streaming app is running.\n"
+                "        For iOS try --ios-snapshot <url> instead of --source.",
                 file=sys.stderr,
             )
         return False, None
 
-    # Phone streams often don't need warm-up; skip for URL sources.
     if isinstance(source, int) and warmup_frames > 0:
         print(f"[camera] Warming up ({warmup_frames} frames) …", end="", flush=True)
         for _ in range(warmup_frames):
@@ -141,21 +176,21 @@ def capture_photo(source: int | str = 0,
         print("[error] Failed to capture frame.", file=sys.stderr)
         return False, None
 
+    h, w = frame.shape[:2]
+    print(f"[camera] Frame captured ({w}×{h}).")
     return True, frame
 
 
 def save_photo(frame, output_dir: Path = OUTPUT_DIR) -> Path:
-    """Save a captured frame as a JPEG and return its path."""
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = output_dir / f"photo_{timestamp}.jpg"
-    cv2.imwrite(str(path), frame)
+    cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
     print(f"[camera] Photo saved → {path}")
     return path
 
 
 def show_preview(frame, timeout_ms: int = 2000) -> None:
-    """Display a brief preview window (skipped in headless environments)."""
     try:
         cv2.imshow("Captured photo — press any key to continue", frame)
         cv2.waitKey(timeout_ms)
@@ -169,17 +204,14 @@ def show_preview(frame, timeout_ms: int = 2000) -> None:
 # ---------------------------------------------------------------------------
 
 def encode_image_base64(image_path: Path) -> str:
-    """Return the base64-encoded contents of an image file."""
     with open(image_path, "rb") as f:
         return base64.standard_b64encode(f.read()).decode("utf-8")
 
 
 def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
-    """Send the photo to Claude claude-sonnet-4-6 and return the analysis text."""
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from environment
+    client = anthropic.Anthropic()
 
     image_data = encode_image_base64(image_path)
-
     question = user_prompt.strip() or (
         "Please analyse this photo in detail following your structured format."
     )
@@ -208,10 +240,7 @@ def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
                             "data": image_data,
                         },
                     },
-                    {
-                        "type": "text",
-                        "text": question,
-                    },
+                    {"type": "text", "text": question},
                 ],
             }
         ],
@@ -225,34 +254,52 @@ def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
         f"output: {usage.output_tokens}"
     )
 
-    text_blocks = [b.text for b in response.content if b.type == "text"]
-    return "\n".join(text_blocks)
+    return "\n".join(b.text for b in response.content if b.type == "text")
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Capture a photo from a camera or phone stream and analyse it with Claude.",
+        description="Capture a photo from a camera or phone and analyse it with Claude.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python camera_claude.py                              # default webcam
-  python camera_claude.py --source 1                  # second webcam
-  python camera_claude.py --source http://192.168.1.42:8080/video   # Android IP Webcam
-  python camera_claude.py --source http://192.168.1.42:4747/video   # DroidCam
-  python camera_claude.py --source rtsp://192.168.1.42:8080/h264    # RTSP stream
-  python camera_claude.py "How many people are in this photo?"
+  # Local webcam (default)
+  python camera_claude.py
+
+  # iOS via Camo (USB/Wi-Fi — appears as system webcam)
+  python camera_claude.py --source 1
+
+  # iOS via snapshot URL (IP Camera Lite, iVCam, etc.)
+  python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg
+
+  # Android IP Webcam — MJPEG stream
+  python camera_claude.py --source http://192.168.1.42:8080/video
+
+  # Android IP Webcam — snapshot
+  python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg
+
+  # Custom question
+  python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg "What is on my desk?"
         """,
     )
-    p.add_argument(
+
+    source_group = p.add_mutually_exclusive_group()
+    source_group.add_argument(
         "--source",
         default="0",
         metavar="CAM",
-        help="Camera index (default: 0) or stream URL (MJPEG/RTSP).",
+        help="Camera index (default: 0) or MJPEG/RTSP stream URL.",
     )
+    source_group.add_argument(
+        "--ios-snapshot",
+        metavar="URL",
+        help="iOS/Android snapshot JPEG endpoint, e.g. http://192.168.1.42:8080/shot.jpg",
+    )
+
     p.add_argument(
         "question",
         nargs="*",
@@ -264,22 +311,20 @@ examples:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-
-    source = parse_source(args.source)
     user_prompt = " ".join(args.question)
 
-    # 1. Capture photo.
-    success, frame = capture_photo(source)
+    if args.ios_snapshot:
+        success, frame = capture_from_snapshot_url(args.ios_snapshot)
+    else:
+        source = parse_source(args.source)
+        success, frame = capture_from_stream(source)
+
     if not success:
         sys.exit(1)
 
-    # 2. Show a brief preview (no-op in headless environments).
     show_preview(frame)
-
-    # 3. Save the photo to disk.
     image_path = save_photo(frame)
 
-    # 4. Send to Claude for analysis.
     try:
         analysis = analyse_photo(image_path, user_prompt)
     except anthropic.AuthenticationError:
@@ -293,7 +338,6 @@ def main() -> None:
         print(f"[error] Claude API error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # 5. Display the result.
     print("\n" + "=" * 70)
     print("CLAUDE'S ANALYSIS")
     print("=" * 70)
