@@ -1,48 +1,60 @@
 """
-Camera capture + Claude vision app — with iOS phone camera support.
+Camera capture + Claude vision app — iOS/Android phone camera with Excel export.
 
-Captures a photo from a webcam, Android IP stream, or iOS phone camera,
-saves it to disk, and sends it to Claude claude-sonnet-4-6 for analysis.
+Captures one or more photos from a webcam or phone camera (or imports from a
+local gallery folder), sends each to Claude claude-sonnet-4-6 for structured
+analysis, and exports all results to a formatted Excel workbook.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-iOS SETUP (two options)
+iOS SETUP
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Option A — Camo (USB or Wi-Fi, best quality)
+  Install Camo on iPhone + Mac/PC companion → https://reincubate.com/camo/
+  The iPhone appears as a system webcam:
+    python camera_claude.py --source 1 --count 5
 
-Option A — Camo (recommended, best quality)
-  1. Install Camo on your iPhone: https://reincubate.com/camo/
-  2. Install the Camo desktop companion on your Mac/PC.
-  3. Connect via USB or Wi-Fi — Camo appears as a system webcam (index 0 or 1).
-  4. Run:  python camera_claude.py --source 0   (or --source 1)
-
-Option B — IP camera app (Wi-Fi, no cable needed)
-  Install any MJPEG/snapshot app, e.g.:
-    • "IP Camera Lite" (free, App Store)
-    • "iVCam" (App Store)
-    • "Iriun Webcam" (App Store + desktop client)
-  After starting the server in the app, run with its snapshot URL:
-    python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg
-  Or its MJPEG stream URL if the app provides one:
-    python camera_claude.py --source http://192.168.1.42:8080/video
+Option B — Wi-Fi snapshot (no cable)
+  Install "IP Camera Lite" (App Store) → Start server → note IP address
+    python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg --count 5
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Android SETUP
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Install "IP Webcam" (Play Store), tap "Start server", then:
-    python camera_claude.py --source http://192.168.1.42:8080/video
-  Snapshot mode also works:
-    python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg
+  Install "IP Webcam" (Play Store) → Start server
+    python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg --count 5
+    python camera_claude.py --source http://192.168.1.42:8080/video --count 5
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GALLERY IMPORT (analyse existing photos from your phone or computer)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Single file:
+    python camera_claude.py --gallery photo.jpg
+
+  Multiple files:
+    python camera_claude.py --gallery img1.jpg img2.png img3.heic
+
+  Entire folder (all images inside):
+    python camera_claude.py --gallery ~/Pictures/holiday/
+
+  Mix of files and folders:
+    python camera_claude.py --gallery photo.jpg ~/Downloads/shots/
 """
 
 import argparse
 import base64
+import re
 import sys
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import anthropic
 import cv2
 import numpy as np
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +100,7 @@ CONTEXTUAL & CULTURAL ANALYSIS
 - Highlight anything unusual, unexpected, or noteworthy in the scene.
 
 RESPONSE FORMAT
-Structure every analysis with these sections:
+Structure every analysis with these exact sections and headings:
 1. **Summary** — one-sentence overview of what the photo shows.
 2. **Main Subjects** — primary objects, people, or focal points.
 3. **Environment & Context** — setting, background, spatial layout.
@@ -100,9 +112,18 @@ Be precise, concise, and informative.  If you are uncertain about something,
 say so rather than guessing.  Focus on what is actually visible in the image.
 """
 
+SECTION_KEYS = [
+    "Summary",
+    "Main Subjects",
+    "Environment & Context",
+    "Technical Quality",
+    "Notable Details",
+    "Suggested Follow-up",
+]
+
 
 # ---------------------------------------------------------------------------
-# Camera capture — three modes
+# Camera capture
 # ---------------------------------------------------------------------------
 
 def parse_source(raw: str) -> int | str:
@@ -113,13 +134,7 @@ def parse_source(raw: str) -> int | str:
 
 
 def capture_from_snapshot_url(url: str) -> tuple[bool, object]:
-    """Fetch a single JPEG snapshot over HTTP (iOS/Android snapshot endpoint).
-
-    Compatible with:
-      • IP Camera Lite  → http://<ip>:8080/shot.jpg
-      • IP Webcam (Android) → http://<ip>:8080/shot.jpg
-      • Any app that serves a static JPEG endpoint
-    """
+    """Fetch a single JPEG over HTTP — works with iOS/Android snapshot endpoints."""
     print(f"[camera] Fetching snapshot from {url} …")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "CameraClaude/1.0"})
@@ -128,7 +143,7 @@ def capture_from_snapshot_url(url: str) -> tuple[bool, object]:
     except Exception as exc:
         print(f"[error] Could not fetch snapshot: {exc}", file=sys.stderr)
         print(
-            "[hint]  Make sure your iPhone and this computer are on the same\n"
+            "[hint]  Make sure your phone and this computer are on the same\n"
             "        Wi-Fi network and the camera app server is running.",
             file=sys.stderr,
         )
@@ -147,7 +162,7 @@ def capture_from_snapshot_url(url: str) -> tuple[bool, object]:
 
 def capture_from_stream(source: int | str,
                         warmup_frames: int = CAPTURE_DELAY_FRAMES) -> tuple[bool, object]:
-    """Open a local webcam index or MJPEG/RTSP stream URL."""
+    """Open a local webcam or MJPEG/RTSP stream and grab one frame."""
     label = f"camera {source}" if isinstance(source, int) else f"stream {source}"
     print(f"[camera] Connecting to {label} …")
     cap = cv2.VideoCapture(source)
@@ -156,8 +171,8 @@ def capture_from_stream(source: int | str,
         print(f"[error] Could not open {label}.", file=sys.stderr)
         if isinstance(source, str):
             print(
-                "[hint]  Ensure your phone and this computer share the same\n"
-                "        Wi-Fi network and the streaming app is running.\n"
+                "[hint]  Ensure your phone and this computer share the same Wi-Fi\n"
+                "        network and the streaming app is running.\n"
                 "        For iOS try --ios-snapshot <url> instead of --source.",
                 file=sys.stderr,
             )
@@ -181,6 +196,50 @@ def capture_from_stream(source: int | str,
     return True, frame
 
 
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"}
+
+
+def load_gallery_images(raw_paths: list[str]) -> list[Path]:
+    """Expand a list of file and/or directory paths into individual image files.
+
+    Directories are searched non-recursively for recognised image extensions.
+    Files are validated to have a supported extension.  Duplicates are removed
+    and the final list is sorted by name.
+    """
+    collected: list[Path] = []
+
+    for raw in raw_paths:
+        p = Path(raw).expanduser().resolve()
+
+        if p.is_dir():
+            found = sorted(
+                f for f in p.iterdir()
+                if f.is_file() and f.suffix.lower() in _IMAGE_EXTENSIONS
+            )
+            if not found:
+                print(f"[warn] No images found in directory: {p}", file=sys.stderr)
+            collected.extend(found)
+
+        elif p.is_file():
+            if p.suffix.lower() not in _IMAGE_EXTENSIONS:
+                print(f"[warn] Skipping unsupported file type: {p.name}", file=sys.stderr)
+            else:
+                collected.append(p)
+
+        else:
+            print(f"[warn] Path not found, skipping: {p}", file=sys.stderr)
+
+    # Deduplicate while preserving order
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in collected:
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+
+    return unique
+
+
 def save_photo(frame, output_dir: Path = OUTPUT_DIR) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -190,7 +249,7 @@ def save_photo(frame, output_dir: Path = OUTPUT_DIR) -> Path:
     return path
 
 
-def show_preview(frame, timeout_ms: int = 2000) -> None:
+def show_preview(frame, timeout_ms: int = 1500) -> None:
     try:
         cv2.imshow("Captured photo — press any key to continue", frame)
         cv2.waitKey(timeout_ms)
@@ -208,10 +267,40 @@ def encode_image_base64(image_path: Path) -> str:
         return base64.standard_b64encode(f.read()).decode("utf-8")
 
 
+_MEDIA_TYPE_MAP = {
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png":  "image/png",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
+    # HEIC/BMP/TIFF not natively supported by Claude — convert to JPEG first
+}
+
+
+def ensure_jpeg(image_path: Path) -> Path:
+    """Return a JPEG version of the image, converting with OpenCV if needed."""
+    if image_path.suffix.lower() in (".jpg", ".jpeg"):
+        return image_path
+
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        raise ValueError(f"Cannot read image file: {image_path}")
+
+    jpeg_path = image_path.with_suffix(".converted.jpg")
+    cv2.imwrite(str(jpeg_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    print(f"[gallery] Converted {image_path.name} → {jpeg_path.name}")
+    return jpeg_path
+
+
 def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
+    """Send photo to Claude and return the raw analysis text."""
     client = anthropic.Anthropic()
 
-    image_data = encode_image_base64(image_path)
+    # Convert unsupported formats to JPEG before encoding
+    send_path = ensure_jpeg(image_path)
+    media_type = _MEDIA_TYPE_MAP.get(send_path.suffix.lower(), "image/jpeg")
+
+    image_data = encode_image_base64(send_path)
     question = user_prompt.strip() or (
         "Please analyse this photo in detail following your structured format."
     )
@@ -236,7 +325,7 @@ def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": "image/jpeg",
+                            "media_type": media_type,
                             "data": image_data,
                         },
                     },
@@ -258,32 +347,156 @@ def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Analysis parser
+# ---------------------------------------------------------------------------
+
+def parse_analysis(text: str) -> dict[str, str]:
+    """Extract the 6 structured sections from Claude's Markdown analysis."""
+    result = {k: "" for k in SECTION_KEYS}
+
+    # Match **Section Name** (optional dash/em-dash) then content until the
+    # next numbered section heading or end of string.
+    pattern = re.compile(
+        r"\*\*(" + "|".join(re.escape(k) for k in SECTION_KEYS) + r")\*\*"
+        r"[^\n]*\n?"           # optional remainder of the heading line
+        r"(.*?)"               # section body (non-greedy)
+        r"(?=\n\d+\.\s+\*\*|\Z)",  # stop at next numbered heading or EOF
+        re.DOTALL,
+    )
+
+    for match in pattern.finditer(text):
+        key = match.group(1)
+        body = match.group(2).strip()
+        result[key] = body
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Excel export
+# ---------------------------------------------------------------------------
+
+_HDR_FILL = PatternFill("solid", fgColor="1F3864")   # dark navy
+_HDR_FONT = Font(bold=True, color="FFFFFF", size=11)
+_HDR_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+_EVEN_FILL = PatternFill("solid", fgColor="D6E4F0")  # light blue
+_ODD_FILL = PatternFill("solid", fgColor="FFFFFF")
+_DATA_ALIGN = Alignment(vertical="top", wrap_text=True)
+
+_BORDER = Border(
+    left=Side(style="thin", color="BFBFBF"),
+    right=Side(style="thin", color="BFBFBF"),
+    top=Side(style="thin", color="BFBFBF"),
+    bottom=Side(style="thin", color="BFBFBF"),
+)
+
+_COLUMNS = [
+    ("#",                     5),
+    ("Timestamp",            20),
+    ("Photo File",           36),
+    ("Summary",              45),
+    ("Main Subjects",        35),
+    ("Environment & Context",35),
+    ("Technical Quality",    35),
+    ("Notable Details",      35),
+    ("Suggested Follow-up",  35),
+]
+
+
+def save_to_excel(records: list[dict], output_path: Path) -> None:
+    """Write all photo analysis records to a formatted Excel workbook."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Photo Analysis"
+
+    # ── Header row ──────────────────────────────────────────────────────────
+    ws.row_dimensions[1].height = 32
+    for col, (header, width) in enumerate(_COLUMNS, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = _HDR_FONT
+        cell.fill = _HDR_FILL
+        cell.alignment = _HDR_ALIGN
+        cell.border = _BORDER
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    ws.freeze_panes = "A2"
+
+    # ── Data rows ───────────────────────────────────────────────────────────
+    for row_idx, rec in enumerate(records, 2):
+        fill = _EVEN_FILL if row_idx % 2 == 0 else _ODD_FILL
+        ws.row_dimensions[row_idx].height = 90
+
+        values = [
+            row_idx - 1,
+            rec["timestamp"],
+            rec["photo_path"],
+            rec["Summary"],
+            rec["Main Subjects"],
+            rec["Environment & Context"],
+            rec["Technical Quality"],
+            rec["Notable Details"],
+            rec["Suggested Follow-up"],
+        ]
+
+        for col, value in enumerate(values, 1):
+            cell = ws.cell(row=row_idx, column=col, value=value)
+            cell.fill = fill
+            cell.alignment = _DATA_ALIGN
+            cell.border = _BORDER
+
+    # ── Summary sheet ────────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Summary")
+    ws2.column_dimensions["A"].width = 25
+    ws2.column_dimensions["B"].width = 60
+
+    meta_rows = [
+        ("Generated",     datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Total photos",  len(records)),
+        ("Model",         MODEL),
+    ]
+    for r, (label, value) in enumerate(meta_rows, 1):
+        ws2.cell(r, 1, label).font = Font(bold=True)
+        ws2.cell(r, 2, value)
+
+    wb.save(output_path)
+    print(f"[excel]  Workbook saved → {output_path.resolve()}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Capture a photo from a camera or phone and analyse it with Claude.",
+        description="Capture or import photos and export Claude analysis to Excel.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # Local webcam (default)
+  # iOS — Camo (USB/Wi-Fi), take 3 photos
+  python camera_claude.py --source 1 --count 3
+
+  # iOS — snapshot URL (IP Camera Lite), take 5 photos
+  python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg --count 5
+
+  # Android — IP Webcam snapshot, custom question
+  python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg \\
+      --count 4 --excel my_report.xlsx "What products are visible?"
+
+  # Gallery import — single file
+  python camera_claude.py --gallery photo.jpg
+
+  # Gallery import — multiple files
+  python camera_claude.py --gallery img1.jpg img2.png img3.heic
+
+  # Gallery import — entire folder
+  python camera_claude.py --gallery ~/Pictures/holiday/
+
+  # Gallery import — mix of files and folder, custom question
+  python camera_claude.py --gallery photo.jpg ~/Downloads/shots/ "Describe the scene"
+
+  # Default webcam, single shot
   python camera_claude.py
-
-  # iOS via Camo (USB/Wi-Fi — appears as system webcam)
-  python camera_claude.py --source 1
-
-  # iOS via snapshot URL (IP Camera Lite, iVCam, etc.)
-  python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg
-
-  # Android IP Webcam — MJPEG stream
-  python camera_claude.py --source http://192.168.1.42:8080/video
-
-  # Android IP Webcam — snapshot
-  python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg
-
-  # Custom question
-  python camera_claude.py --ios-snapshot http://192.168.1.42:8080/shot.jpg "What is on my desk?"
         """,
     )
 
@@ -292,41 +505,62 @@ examples:
         "--source",
         default="0",
         metavar="CAM",
-        help="Camera index (default: 0) or MJPEG/RTSP stream URL.",
+        help="Camera index (default: 0) or MJPEG/RTSP URL.",
     )
     source_group.add_argument(
         "--ios-snapshot",
         metavar="URL",
-        help="iOS/Android snapshot JPEG endpoint, e.g. http://192.168.1.42:8080/shot.jpg",
+        help="iOS/Android JPEG snapshot endpoint, e.g. http://192.168.1.42:8080/shot.jpg",
+    )
+    source_group.add_argument(
+        "--gallery",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Analyse existing images instead of capturing live. "
+            "Accepts one or more image files and/or folders. "
+            "Supported formats: JPG, PNG, BMP, TIFF, WEBP, HEIC."
+        ),
     )
 
     p.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of live photos to capture (default: 1). Ignored with --gallery.",
+    )
+    p.add_argument(
+        "--excel",
+        metavar="FILE",
+        help="Output Excel filename (default: analysis_TIMESTAMP.xlsx).",
+    )
+    p.add_argument(
         "question",
         nargs="*",
-        help="Optional custom question to ask Claude about the photo.",
+        help="Optional custom question to ask Claude about each photo.",
     )
     return p
 
 
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    user_prompt = " ".join(args.question)
-
+def do_capture(args) -> tuple[bool, object]:
+    """Dispatch to the correct live-capture method based on CLI args."""
     if args.ios_snapshot:
-        success, frame = capture_from_snapshot_url(args.ios_snapshot)
-    else:
-        source = parse_source(args.source)
-        success, frame = capture_from_stream(source)
+        return capture_from_snapshot_url(args.ios_snapshot)
+    return capture_from_stream(parse_source(args.source))
 
-    if not success:
-        sys.exit(1)
 
-    show_preview(frame)
-    image_path = save_photo(frame)
+def analyse_and_record(
+    image_path: Path,
+    label: str,
+    user_prompt: str,
+    records: list[dict],
+) -> None:
+    """Analyse one image, print the result, and append to records."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        analysis = analyse_photo(image_path, user_prompt)
+        raw_analysis = analyse_photo(image_path, user_prompt)
     except anthropic.AuthenticationError:
         print(
             "[error] ANTHROPIC_API_KEY is missing or invalid.\n"
@@ -334,16 +568,79 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    except anthropic.APIError as exc:
-        print(f"[error] Claude API error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    except (anthropic.APIError, ValueError) as exc:
+        print(f"[error] {label}: {exc}", file=sys.stderr)
+        return
 
-    print("\n" + "=" * 70)
-    print("CLAUDE'S ANALYSIS")
+    sections = parse_analysis(raw_analysis)
+
+    print(f"\n{'=' * 70}")
+    print(f"{label} — CLAUDE'S ANALYSIS")
     print("=" * 70)
-    print(analysis)
+    print(raw_analysis)
     print("=" * 70)
-    print(f"\nPhoto saved at: {image_path.resolve()}")
+
+    records.append(
+        {
+            "timestamp": timestamp,
+            "photo_path": str(image_path.resolve()),
+            **sections,
+        }
+    )
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    user_prompt = " ".join(args.question)
+    excel_path = Path(
+        args.excel or f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    )
+    records: list[dict] = []
+
+    # ── Gallery import mode ───────────────────────────────────────────────────
+    if args.gallery:
+        gallery_files = load_gallery_images(args.gallery)
+        if not gallery_files:
+            print("[error] No valid image files found in the provided paths.", file=sys.stderr)
+            sys.exit(1)
+
+        total = len(gallery_files)
+        print(f"[gallery] Found {total} image(s) to analyse.")
+
+        for idx, image_path in enumerate(gallery_files, 1):
+            print(f"\n[gallery] Processing {idx}/{total}: {image_path.name}")
+            analyse_and_record(image_path, f"IMAGE {idx}/{total} ({image_path.name})", user_prompt, records)
+
+    # ── Live camera mode ──────────────────────────────────────────────────────
+    else:
+        count = max(1, args.count)
+
+        for shot in range(1, count + 1):
+            if count > 1:
+                try:
+                    input(f"\n[{shot}/{count}] Point your camera at the subject and press Enter …")
+                except (EOFError, KeyboardInterrupt):
+                    print("\n[info] Capture stopped by user.")
+                    break
+
+            success, frame = do_capture(args)
+            if not success:
+                print(f"[warn] Skipping photo {shot} — capture failed.", file=sys.stderr)
+                continue
+
+            show_preview(frame)
+            image_path = save_photo(frame)
+            analyse_and_record(image_path, f"PHOTO {shot}/{count}", user_prompt, records)
+
+    # ── Export to Excel ───────────────────────────────────────────────────────
+    if records:
+        save_to_excel(records, excel_path)
+        print(f"\n[done]  {len(records)} photo(s) analysed.")
+        print(f"[done]  Excel report → {excel_path.resolve()}")
+    else:
+        print("[warn]  No photos were successfully analysed; Excel not written.", file=sys.stderr)
 
 
 if __name__ == "__main__":
