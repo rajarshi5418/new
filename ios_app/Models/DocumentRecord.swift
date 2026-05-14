@@ -73,28 +73,28 @@ final class DocumentRecord {
         self.suggestedFollowUp = suggestedFollowUp
     }
 
-    /// Convenience initialiser that populates from an AnalysisResult.
-    convenience init(from result: AnalysisResult, photoPath: String) {
-        self.init(
-            photoPath: photoPath,
-            name: result.name,
-            department: result.department,
-            fileNo: result.fileNo,
-            sanchikaNo: result.sanchikaNo,
-            rankId: result.rankId,
-            unit: result.unit,
-            subjectHindi: result.subjectHindi,
-            subjectEnglish: result.subjectEnglish,
-            year: result.year,
-            purpose: result.purpose,
-            rawAnalysis: result.rawText,
-            summary: result.summary,
-            mainSubjects: result.mainSubjects,
-            environmentContext: result.environmentContext,
-            technicalQuality: result.technicalQuality,
-            notableDetails: result.notableDetails,
-            suggestedFollowUp: result.suggestedFollowUp
-        )
+    /// Designated initialiser that populates from an AnalysisResult.
+    init(from result: AnalysisResult, photoPath: String) {
+        self.id = UUID()
+        self.timestamp = Date()
+        self.photoPath = photoPath
+        self.name = result.name
+        self.department = result.department
+        self.fileNo = result.fileNo
+        self.sanchikaNo = result.sanchikaNo
+        self.rankId = result.rankId
+        self.unit = result.unit
+        self.subjectHindi = result.subjectHindi
+        self.subjectEnglish = result.subjectEnglish
+        self.year = result.year
+        self.purpose = result.purpose
+        self.rawAnalysis = result.rawText
+        self.summary = result.summary
+        self.mainSubjects = result.mainSubjects
+        self.environmentContext = result.environmentContext
+        self.technicalQuality = result.technicalQuality
+        self.notableDetails = result.notableDetails
+        self.suggestedFollowUp = result.suggestedFollowUp
     }
 
     /// Formatted timestamp string for display.
