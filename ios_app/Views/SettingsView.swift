@@ -125,6 +125,13 @@ struct SettingsView: View {
                     .disabled(allRecords.isEmpty)
                 }
 
+                // ── Device Specs ──────────────────────────────────────────────
+                Section("Device") {
+                    NavigationLink(destination: SystemInfoView()) {
+                        Label("System Specifications", systemImage: "cpu")
+                    }
+                }
+
                 // ── About ─────────────────────────────────────────────────────
                 Section("About") {
                     HStack {
