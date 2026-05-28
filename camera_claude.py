@@ -306,7 +306,9 @@ def ensure_jpeg(image_path: Path) -> Path:
 
 def analyse_photo(image_path: Path, user_prompt: str = "") -> str:
     """Send photo to Claude and return the raw analysis text."""
-    client = anthropic.Anthropic()
+    import os
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    client = anthropic.Anthropic(auth_token=auth_token) if auth_token else anthropic.Anthropic()
 
     # Convert unsupported formats to JPEG before encoding
     send_path = ensure_jpeg(image_path)
