@@ -258,6 +258,18 @@ def show_preview(frame, timeout_ms: int = 1500) -> None:
         pass
 
 
+def crop_frame(frame, crop: tuple[int, int, int, int]):
+    """Crop frame to (x, y, w, h) pixel region, clamped to image bounds."""
+    img_h, img_w = frame.shape[:2]
+    x, y, cw, ch = crop
+    x  = max(0, min(x,  img_w - 1))
+    y  = max(0, min(y,  img_h - 1))
+    cw = max(1, min(cw, img_w - x))
+    ch = max(1, min(ch, img_h - y))
+    print(f"[camera] Cropped to region ({x},{y}) {cw}×{ch} px.")
+    return frame[y : y + ch, x : x + cw]
+
+
 # ---------------------------------------------------------------------------
 # Claude API
 # ---------------------------------------------------------------------------
@@ -497,6 +509,12 @@ examples:
 
   # Default webcam, single shot
   python camera_claude.py
+
+  # Crop to a 640×480 region at offset (100, 50) before sending to Claude
+  python camera_claude.py --crop 100 50 640 480
+
+  # Gallery import with crop region
+  python camera_claude.py --gallery ~/Photos/ --crop 0 0 1280 720
         """,
     )
 
@@ -529,6 +547,17 @@ examples:
         default=1,
         metavar="N",
         help="Number of live photos to capture (default: 1). Ignored with --gallery.",
+    )
+    p.add_argument(
+        "--crop",
+        nargs=4,
+        type=int,
+        metavar=("X", "Y", "W", "H"),
+        help=(
+            "Limit capture to a pixel region — X Y W H "
+            "(left column, top row, width, height). "
+            "Applied to every live frame and gallery image before analysis."
+        ),
     )
     p.add_argument(
         "--excel",
@@ -611,6 +640,12 @@ def main() -> None:
 
         for idx, image_path in enumerate(gallery_files, 1):
             print(f"\n[gallery] Processing {idx}/{total}: {image_path.name}")
+            if args.crop:
+                frame = cv2.imread(str(image_path))
+                if frame is not None:
+                    frame = crop_frame(frame, tuple(args.crop))
+                    image_path = image_path.parent / f"{image_path.stem}_crop.jpg"
+                    cv2.imwrite(str(image_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
             analyse_and_record(image_path, f"IMAGE {idx}/{total} ({image_path.name})", user_prompt, records)
 
     # ── Live camera mode ──────────────────────────────────────────────────────
@@ -630,6 +665,8 @@ def main() -> None:
                 print(f"[warn] Skipping photo {shot} — capture failed.", file=sys.stderr)
                 continue
 
+            if args.crop:
+                frame = crop_frame(frame, tuple(args.crop))
             show_preview(frame)
             image_path = save_photo(frame)
             analyse_and_record(image_path, f"PHOTO {shot}/{count}", user_prompt, records)
